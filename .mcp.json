@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "research-log": {
+      "command": "uv",
+      "args": ["run", "research-log-mcp"],
+      "env": {
+        "RESEARCH_LOG_DB": "${HOME}/.research-log/log.sqlite3"
+      }
+    }
+  }
+}
