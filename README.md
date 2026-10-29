@@ -103,7 +103,13 @@ Caching rules:
 - A **versioned** request (`1706.03762v5`) is cached per version, so two
   versions of one paper can coexist.
 - If a cached PDF file goes missing on disk, the paper is re-fetched.
-- Outbound requests are throttled to one every 3 seconds, per arXiv's API
+- PDFs are downloaded from the public Google Cloud Storage mirror
+  `gs://arxiv-dataset` (the bucket behind Kaggle's arXiv Dataset; anonymous,
+  free, no rate limit, updated continuously) when it has the requested version,
+  falling back to `arxiv.org/pdf` otherwise. Metadata always comes from the
+  arXiv API. Set `RESEARCH_LOG_ARXIV_MIRROR=0` to go straight to arxiv.org.
+  Each cached paper records its `origin`.
+- Requests to arxiv.org are throttled to one every 3 seconds, per arXiv's API
   terms of use, and carry an identifying User-Agent.
 
 Cache layout (`--arxiv-dir`, `RESEARCH_LOG_ARXIV_DIR`, default `~/.research-log/arxiv`):
@@ -146,6 +152,40 @@ with offsets); naive values are treated as UTC.
 | Reading notes not about transformers | `search_events(tags_any=["reading","paper"], tags_none=["transformers"])` |
 | Phrase + prefix | `search_events(query='"learning rate" AND diverg*', order="relevance")` |
 | Open todos | `search_events(kinds=["todo"])` then `get_event` to see if any annotation closed them |
+
+### Starting from an existing arXiv collection
+
+You do not need to bulk-download anything to "have" arXiv: the cache lazily
+pulls from the `gs://arxiv-dataset` mirror, which holds every arXiv PDF, so the
+whole corpus is effectively one request away and only what you read is stored.
+If you do want a local, offline subset, these are the collections to start from
+(figures as of late 2026; see the sources in each link):
+
+| Collection | What it is | Size | Notes |
+|---|---|---|---|
+| [`gs://arxiv-dataset`](https://www.kaggle.com/datasets/Cornell-University/arxiv) (Kaggle / Google Cloud) | Every arXiv PDF, one object per version, `arxiv/arxiv/pdf/YYMM/<id>v<n>.pdf` | Whole corpus ≈ 6–7 TB for latest versions | Free, anonymous HTTPS. This is what the cache uses. Filter ids by category with the Kaggle metadata JSON (~4.5 GB, has a `categories` field) and copy only what you want. |
+| [arXiv S3 bulk data](https://info.arxiv.org/help/bulk_data_s3.html) | Official tarballs, `pdf/arXiv_pdf_YYMM_NNN.tar` (~500 MB each) | PDFs ≈ 2.7 TB (Mar 2023), growing ~100 GB/month; PDF+source ≈ 9.2 TB (Apr 2025) | Requester-pays (you pay AWS egress, roughly $0.09/GB). Tar chunks are by month, not category, so you download everything to get math+CS. |
+| [`secemp9/arxiv-complete`](https://huggingface.co/datasets/secemp9/arxiv-complete) (Hugging Face) | Parquet shards: `pdf` 8.65 TB (all versions; ≈ 6.6 TB latest only), `paper_text` 70 GB, `latex` 160 GB, `metadata` 1.6 GB with `primary_category` | 16 TB total | Row-group pruning lets you fetch single shards; no per-category split. |
+| [unarXive](https://github.com/IllDepence/unarXive) / [S2ORC](https://github.com/allenai/s2orc) / [RedPajama arXiv](https://huggingface.co/datasets/togethercomputer/RedPajama-Data-1T) | Full text (from LaTeX), no PDFs | Tens of GB to a few hundred GB | Right choice if you only need searchable text, not the PDFs themselves. |
+
+**How big is math + CS?** The arXiv API reports about 970k papers in `cs.*`
+and 700k in `math.*`, 1.61M in the union (roughly half of arXiv's 3.15M
+papers). Sampling latest-version PDFs from the mirror across 2008–2026 gives a
+median of 0.36 MB (mean 0.5 MB) for math and 0.75 MB (mean 2–4 MB, heavy-tailed
+because of figures) for CS. That puts a complete local copy at roughly:
+
+| Subset | Papers | Estimated PDF size |
+|---|---|---|
+| math.* | 700k | 300–400 GB |
+| cs.* | 970k | 2–3 TB |
+| math ∪ cs | 1.61M | 2.5–3.5 TB |
+| Text only (from `paper_text` / unarXive) for math ∪ cs | 1.61M | 30–40 GB |
+
+A practical middle ground is to pre-seed by *month* for your fields: list the
+ids for `cat:cs.* OR cat:math.*` in a date window from the Kaggle metadata, then
+call `arxiv_fetch` for each (or copy the objects straight from the mirror into
+`pdf/` and index them). Recent years dominate the volume: roughly 45% of all
+arXiv submissions in 2025 were CS and 15% math.
 
 ## Ingesting an existing log
 

@@ -1,12 +1,13 @@
 """Offline tests for the arXiv cache using a mocked HTTP transport."""
 
 import io
+import re
 
 import httpx
 import pytest
 from pypdf import PdfWriter
 
-from research_log_mcp.arxiv_cache import ArxivCache, ArxivError, parse_arxiv_id
+from research_log_mcp.arxiv_cache import ArxivCache, ArxivError, gcs_mirror_path, parse_arxiv_id
 
 
 def make_pdf(pages=("hello transformer world", "second page about attention")) -> bytes:
@@ -44,13 +45,19 @@ MISSING = """<?xml version='1.0' encoding='UTF-8'?>
 class FakeArxiv:
     """Pretends to be export.arxiv.org + arxiv.org; counts requests."""
 
-    def __init__(self, latest_version=7):
+    def __init__(self, latest_version=7, mirror_has_versions=()):
         self.latest = latest_version
         self.calls: list[str] = []
         self.pdf = make_pdf()
+        self.mirror_has_versions = set(mirror_has_versions)  # versions the GCS mirror can serve
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(str(request.url))
+        if request.url.host == "storage.googleapis.com":
+            m = re.search(r"v(\d+)\.pdf$", request.url.path)
+            if m and int(m.group(1)) in self.mirror_has_versions:
+                return httpx.Response(200, content=self.pdf, headers={"content-type": "application/pdf"})
+            return httpx.Response(404, text="No such object")
         if request.url.host == "export.arxiv.org":
             ident = request.url.params["id_list"]
             if ident.startswith("9999"):
@@ -96,13 +103,14 @@ def test_miss_then_hit(cache, fake, tmp_path):
     assert paper.categories == ["cs.CL", "cs.LG"] and paper.doi == "10.0000/x"
     assert paper.pages == 2 and paper.bytes == len(fake.pdf)
     assert (tmp_path / "arxiv" / "pdf" / "1706.03762v7.pdf").read_bytes() == fake.pdf
-    assert len(fake.calls) == 2  # one API call, one PDF download
+    assert paper.origin == "arxiv.org"
+    assert len(fake.calls) == 3  # API call, mirror miss (404), arxiv.org PDF download
 
     # Unversioned, versioned, and URL forms are all served from cache; arXiv is never contacted again.
     for ident in ("1706.03762", "1706.03762v7", "https://arxiv.org/abs/1706.03762", "arxiv:1706.03762v7"):
         p, hit = cache.get(ident)
         assert hit and p.versioned_id == "1706.03762v7"
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
     assert cache.get("1706.03762")[0].hits == 6
     assert cache.lookup("1706.03762") is not None and cache.lookup("1706.03762v3") is None
 
@@ -111,7 +119,7 @@ def test_specific_older_version_is_fetched_separately(cache, fake):
     cache.get("1706.03762")
     p, hit = cache.get("1706.03762v5")
     assert not hit and p.versioned_id == "1706.03762v5"
-    assert len(fake.calls) == 4
+    assert len(fake.calls) == 6
     assert {p.versioned_id for p in cache.list()} == {"1706.03762v7", "1706.03762v5"}
     assert cache.stats()["papers"] == 2
 
@@ -123,6 +131,35 @@ def test_refresh_refetches(cache, fake):
     assert not hit and p.versioned_id == "1706.03762v8"
     # Unversioned requests now resolve to the newest cached version.
     assert cache.get("1706.03762")[0].versioned_id == "1706.03762v8"
+
+
+def test_gcs_mirror_paths():
+    assert gcs_mirror_path("1706.03762", 7) == "arxiv/arxiv/pdf/1706/1706.03762v7.pdf"
+    assert gcs_mirror_path("hep-th/9901001", 3) == "arxiv/hep-th/pdf/9901/9901001v3.pdf"
+    assert gcs_mirror_path("math.GT/0309136", 1) == "arxiv/math/pdf/0309/0309136v1.pdf"
+
+
+def test_pdf_served_from_mirror_when_available(tmp_path):
+    fake = FakeArxiv(mirror_has_versions={7})
+    cache = ArxivCache(tmp_path / "arxiv", transport=httpx.MockTransport(fake.handler), min_interval=0)
+    try:
+        paper, hit = cache.get("1706.03762")
+        assert not hit and paper.origin == "gcs-mirror"
+        assert [u for u in fake.calls if "arxiv.org/pdf" in u] == []  # arxiv.org never asked for the PDF
+        assert any("storage.googleapis.com" in u for u in fake.calls)
+    finally:
+        cache.close()
+
+
+def test_mirror_disabled_by_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("RESEARCH_LOG_ARXIV_MIRROR", "0")
+    fake = FakeArxiv(mirror_has_versions={7})
+    cache = ArxivCache(tmp_path / "arxiv", transport=httpx.MockTransport(fake.handler), min_interval=0)
+    try:
+        paper, _ = cache.get("1706.03762")
+        assert paper.origin == "arxiv.org" and not any("storage.googleapis.com" in u for u in fake.calls)
+    finally:
+        cache.close()
 
 
 def test_unknown_id_errors(cache):

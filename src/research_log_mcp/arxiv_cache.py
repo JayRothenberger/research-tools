@@ -5,7 +5,11 @@
   small SQLite database (with FTS5 over title/abstract/full text).
 * Every later request for the same paper is served from disk, never touching
   arXiv again (unless ``refresh=True``).
-* A global throttle keeps outbound requests >= 3 s apart, per arXiv's API terms.
+* PDFs are fetched from the public Google Cloud Storage mirror of arXiv
+  (``gs://arxiv-dataset``, maintained for the Kaggle arXiv dataset) when it has
+  the requested version, and from arxiv.org otherwise. Metadata always comes
+  from the arXiv API. Requests to arxiv.org are throttled to >= 3 s apart, per
+  arXiv's API terms; the mirror is not rate limited.
 
 Layout under the cache dir (default ``~/.research-log/arxiv``)::
 
@@ -36,6 +40,8 @@ from . import __version__
 DEFAULT_CACHE_DIR = Path(os.environ.get("RESEARCH_LOG_ARXIV_DIR", "~/.research-log/arxiv")).expanduser()
 API_URL = "https://export.arxiv.org/api/query"
 PDF_URL = "https://arxiv.org/pdf/{id}"
+# Public, anonymously readable mirror of all arXiv PDFs (backs the Kaggle "arXiv Dataset").
+GCS_MIRROR = "https://storage.googleapis.com/arxiv-dataset/{path}"
 USER_AGENT = f"research-log-mcp/{__version__} (+https://github.com/JayRothenberger/research-tools)"
 MIN_REQUEST_INTERVAL = 3.0  # seconds, per https://info.arxiv.org/help/api/tou.html
 PAGE_SEP = "\f"
@@ -69,6 +75,19 @@ def _safe_name(versioned_id: str) -> str:
     return versioned_id.replace("/", "_")
 
 
+def gcs_mirror_path(base_id: str, version: int) -> str:
+    """Object path of a PDF in the gs://arxiv-dataset mirror.
+
+    New-style ids live under ``arxiv/arxiv/pdf/YYMM/<id>v<n>.pdf``; old-style ids
+    under ``arxiv/<archive>/pdf/YYMM/<number>v<n>.pdf`` (e.g. ``arxiv/hep-th/pdf/9901/9901001v3.pdf``).
+    """
+    if "/" in base_id:
+        archive, number = base_id.split("/", 1)
+        archive = archive.split(".")[0]  # math.GT/0309136 -> math
+        return f"arxiv/{archive}/pdf/{number[:4]}/{number}v{version}.pdf"
+    return f"arxiv/arxiv/pdf/{base_id[:4]}/{base_id}v{version}.pdf"
+
+
 @dataclass
 class Paper:
     arxiv_id: str  # base id, e.g. 1706.03762 or hep-th/9901001
@@ -88,6 +107,7 @@ class Paper:
     fetched_at: str
     last_access: str
     hits: int
+    origin: str | None = None
 
     @property
     def versioned_id(self) -> str:
@@ -114,6 +134,7 @@ class Paper:
             "fetched_at": self.fetched_at,
             "last_access": self.last_access,
             "hits": self.hits,
+            "origin": self.origin,
         }
 
 
@@ -137,6 +158,7 @@ CREATE TABLE IF NOT EXISTS papers (
     fetched_at  TEXT NOT NULL,
     last_access TEXT NOT NULL,
     hits        INTEGER NOT NULL DEFAULT 0,
+    origin      TEXT,                -- 'gcs-mirror' or 'arxiv.org'
     PRIMARY KEY (arxiv_id, version)
 );
 CREATE TABLE IF NOT EXISTS latest (
@@ -183,6 +205,8 @@ class ArxivCache:
             transport=transport, headers={"User-Agent": USER_AGENT}, follow_redirects=True, timeout=httpx.Timeout(60.0)
         )
         self._throttle = _Throttle(min_interval)
+        self.use_mirror = os.environ.get("RESEARCH_LOG_ARXIV_MIRROR", "1") not in ("0", "false", "no")
+        self.last_pdf_origin: str | None = None
 
     def close(self) -> None:
         self._http.close()
@@ -232,11 +256,21 @@ class ArxivCache:
             "doi": (entry.findtext("arxiv:doi", default=None, namespaces=_ATOM) or None),
         }
 
-    def _fetch_pdf(self, versioned_id: str) -> bytes:
+    def _fetch_pdf(self, base_id: str, version: int) -> bytes:
+        versioned_id = f"{base_id}v{version}"
+        if self.use_mirror:
+            try:
+                r = self._http.get(GCS_MIRROR.format(path=gcs_mirror_path(base_id, version)))
+                if r.status_code == 200 and r.content.startswith(b"%PDF"):
+                    self.last_pdf_origin = "gcs-mirror"
+                    return r.content
+            except httpx.HTTPError:
+                pass  # fall through to arxiv.org
         r = self._get(PDF_URL.format(id=versioned_id))
         ctype = r.headers.get("content-type", "")
         if "pdf" not in ctype and not r.content.startswith(b"%PDF"):
             raise ArxivError(f"arXiv did not return a PDF for {versioned_id} (content-type {ctype!r})")
+        self.last_pdf_origin = "arxiv.org"
         return r.content
 
     # ----------------------------------------------------------- extraction
@@ -269,6 +303,7 @@ class ArxivCache:
             abstract=r["abstract"], published=r["published"], updated=r["updated"], categories=json.loads(r["categories"]),
             doi=r["doi"], pdf_path=r["pdf_path"], text_path=r["text_path"], pages=r["pages"], bytes=int(r["bytes"]),
             sha256=r["sha256"], fetched_at=r["fetched_at"], last_access=r["last_access"], hits=int(r["hits"]),
+            origin=r["origin"],
         )
 
     def _cached_version_for(self, base_id: str, version: int | None) -> Paper | None:
@@ -311,7 +346,7 @@ class ArxivCache:
             self._remember_latest(base_id, resolved_v, version is None)
             return self._touch(existing), True
 
-        pdf = self._fetch_pdf(versioned)
+        pdf = self._fetch_pdf(base_id, resolved_v)
         import hashlib
 
         sha = hashlib.sha256(pdf).hexdigest()
@@ -329,12 +364,12 @@ class ArxivCache:
             cur.execute("DELETE FROM papers_fts WHERE versioned_id = ?", (versioned,))
             cur.execute(
                 """INSERT INTO papers (arxiv_id, version, title, authors, abstract, published, updated, categories, doi,
-                                       pdf_path, text_path, pages, bytes, sha256, fetched_at, last_access, hits)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                                       pdf_path, text_path, pages, bytes, sha256, fetched_at, last_access, hits, origin)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                 (
                     base_id, resolved_v, meta["title"], json.dumps(meta["authors"]), meta["abstract"], meta["published"],
                     meta["updated"], json.dumps(meta["categories"]), meta["doi"], str(pdf_path), str(text_path),
-                    pages or None, len(pdf), sha, now, now,
+                    pages or None, len(pdf), sha, now, now, self.last_pdf_origin,
                 ),
             )
             cur.execute(
