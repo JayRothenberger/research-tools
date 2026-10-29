@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -45,6 +46,9 @@ GCS_MIRROR = "https://storage.googleapis.com/arxiv-dataset/{path}"
 USER_AGENT = f"research-log-mcp/{__version__} (+https://github.com/JayRothenberger/research-tools)"
 MIN_REQUEST_INTERVAL = 3.0  # seconds, per https://info.arxiv.org/help/api/tou.html
 PAGE_SEP = "\f"
+
+# pypdf logs a warning per embedded font when fontTools is absent; the text comes out fine without it.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 _NEW_ID = r"\d{4}\.\d{4,5}"
 _OLD_ID = r"[a-z\-]+(?:\.[A-Z]{2})?/\d{7}"
