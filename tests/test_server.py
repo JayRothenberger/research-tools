@@ -16,7 +16,7 @@ def _ok(res):
 @asynccontextmanager
 async def connect(tmp_path):
     params = StdioServerParameters(
-        command=sys.executable, args=["-m", "research_log_mcp", "--db", str(tmp_path / "log.sqlite3")]
+        command=sys.executable, args=["-m", "research_log_mcp", "--db", str(tmp_path / "log.sqlite3"), "--arxiv-dir", str(tmp_path / "arxiv")]
     )
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as s:
@@ -30,6 +30,7 @@ async def test_tool_listing(tmp_path):
         assert names == {
             "append_event", "append_events", "annotate_event", "search_events", "get_event",
             "get_events", "list_tags", "list_sources", "log_stats", "export_events",
+            "arxiv_fetch", "arxiv_text", "arxiv_search_cache", "arxiv_list_cache",
         }
 
 
@@ -110,3 +111,18 @@ async def test_resources(tmp_path):
         assert json.loads(ev.contents[0].text)["text"] == "resource me"
         tags = await session.read_resource("researchlog://tags")
         assert json.loads(tags.contents[0].text) == [{"tag": "r", "count": 1}]
+
+
+async def test_arxiv_tools_offline(tmp_path, monkeypatch):
+    """arXiv tools are registered; errors for unparsable ids are reported (no network needed)."""
+    async with connect(tmp_path) as session:
+        names = {t.name for t in (await session.list_tools()).tools}
+        assert {"arxiv_fetch", "arxiv_text", "arxiv_search_cache", "arxiv_list_cache"} <= names
+        templates = {str(t.uri_template) for t in (await session.list_resource_templates()).resource_templates}
+        assert {"arxiv://{arxiv_id}/pdf", "arxiv://{arxiv_id}/text", "arxiv://{arxiv_id}/meta"} <= templates
+        bad = await session.call_tool("arxiv_fetch", {"id_or_url": "not an id"})
+        assert bad.is_error and "Could not parse an arXiv identifier" in bad.content[0].text
+        empty = _ok(await session.call_tool("arxiv_list_cache", {}))
+        assert empty["stats"]["papers"] == 0 and empty["papers"] == []
+        none = _ok(await session.call_tool("arxiv_search_cache", {"query": "anything"}))
+        assert none["results"] == []

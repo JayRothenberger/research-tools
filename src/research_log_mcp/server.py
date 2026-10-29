@@ -12,12 +12,19 @@ list_tags         – tag vocabulary with counts (optionally filtered by prefix)
 list_sources      – ingestion sources with counts and date ranges
 log_stats         – summary statistics
 export_events     – dump matching events as JSONL or Markdown
+arxiv_fetch       – get an arXiv paper (metadata + text); served from the local cache after the first fetch
+arxiv_text        – read a page range of a cached paper
+arxiv_search_cache– full-text search across all cached papers
+arxiv_list_cache  – list cached papers
 
 Resources
 ---------
 researchlog://events/{id}   – one event as JSON
 researchlog://tags          – tag vocabulary as JSON
 researchlog://stats         – summary statistics as JSON
+arxiv://{id}/pdf            – the cached PDF (binary)
+arxiv://{id}/text           – extracted full text
+arxiv://{id}/meta           – metadata as JSON
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
+from .arxiv_cache import DEFAULT_CACHE_DIR, ArxivCache, ArxivError
 from .store import DEFAULT_DB_PATH, DuplicateSourceRef, NewEvent, Order, ResearchLogStore
 
 INSTRUCTIONS = """\
@@ -40,6 +48,10 @@ append_event with `refs`). Use short, consistent lower-case tags (e.g. project n
 topics, experiment ids). Prefer `kind` values from: note, idea, question, hypothesis,
 experiment, result, decision, todo, reference, meeting, annotation. Full-text search
 supports FTS5 syntax (AND / OR / NOT, "exact phrase", prefix*).
+
+The server also caches arXiv papers: arxiv_fetch returns metadata and text for an id or URL,
+downloading from arXiv only the first time. Use arxiv_text to read specific pages and
+arxiv_search_cache to search across everything already cached.
 """
 
 
@@ -88,7 +100,7 @@ def _surface_errors(fn: _F) -> _F:
             return fn(*args, **kwargs)
         except ToolError:
             raise
-        except (ValueError, DuplicateSourceRef) as e:
+        except (ValueError, DuplicateSourceRef, ArxivError) as e:
             raise ToolError(str(e)) from e
 
     return wrapper  # type: ignore[return-value]
@@ -108,15 +120,21 @@ def _event_to_markdown(e: dict[str, Any]) -> str:
     return f"{head}\n_{' · '.join(meta_bits)}_\n\n{e['text']}\n"
 
 
-def create_server(db_path: str | os.PathLike[str] | None = None) -> MCPServer:
+def create_server(
+    db_path: str | os.PathLike[str] | None = None,
+    arxiv_dir: str | os.PathLike[str] | None = None,
+    *,
+    arxiv_cache: ArxivCache | None = None,
+) -> MCPServer:
     store = ResearchLogStore(db_path or os.environ.get("RESEARCH_LOG_DB") or DEFAULT_DB_PATH)
+    arxiv = arxiv_cache or ArxivCache(arxiv_dir or os.environ.get("RESEARCH_LOG_ARXIV_DIR") or DEFAULT_CACHE_DIR)
     mcp = MCPServer(
         name="research-log",
         title="Research Log",
         instructions=INSTRUCTIONS,
         version="0.1.0",
     )
-    mcp.state = {"store": store}  # type: ignore[attr-defined]
+    mcp.state = {"store": store, "arxiv": arxiv}  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ writes
     @mcp.tool(description="Append one event to the research log. Events are immutable once written.")
@@ -298,6 +316,98 @@ def create_server(db_path: str | os.PathLike[str] | None = None) -> MCPServer:
     def stats_resource() -> str:
         return json.dumps(store.stats(), indent=2)
 
+    # ------------------------------------------------------------ arXiv cache
+    @mcp.tool(
+        description=(
+            "Fetch an arXiv paper by id or URL (e.g. 1706.03762, 1706.03762v5, arXiv:hep-th/9901001, "
+            "https://arxiv.org/abs/2301.00001). The PDF and metadata are downloaded from arXiv the first time and "
+            "served from the local cache forever after. Returns metadata, cache status, and the first pages of text. "
+            "Optionally records a `reference` event in the research log."
+        )
+    )
+    @_surface_errors
+    def arxiv_fetch(
+        id_or_url: Annotated[str, Field(description="arXiv identifier or abs/pdf URL; version suffix optional.")],
+        include_text: Annotated[bool, Field(description="Include extracted text (first pages, up to max_chars).")] = True,
+        max_chars: Annotated[int, Field(ge=0, le=200000, description="Cap on returned text characters.")] = 12000,
+        refresh: Annotated[bool, Field(description="Re-download even if cached (e.g. to pick up a new version).")] = False,
+        log_reference: Annotated[bool, Field(description="Also append a `reference` event (title, authors, abs URL) to the research log.")] = False,
+        tags: Annotated[list[str], Field(description="Extra tags for the logged reference event.")] = [],
+    ) -> dict[str, Any]:
+        paper, from_cache = arxiv.get(id_or_url, refresh=refresh)
+        out: dict[str, Any] = {"from_cache": from_cache, "paper": paper.to_dict()}
+        if include_text and max_chars > 0:
+            text, first, last = arxiv.read_text(paper)
+            truncated = len(text) > max_chars
+            out["text"] = text[:max_chars]
+            out["text_truncated"] = truncated
+            out["text_pages_total"] = paper.pages
+            if truncated:
+                out["hint"] = "Use arxiv_text(id, first_page, last_page) to read further pages."
+        if log_reference:
+            existing = store.search(source="arxiv", tags_all=[f"arxiv:{paper.arxiv_id}"], limit=1)
+            if existing.total == 0:
+                authors = ", ".join(paper.authors[:6]) + (" et al." if len(paper.authors) > 6 else "")
+                ev = store.append(NewEvent(
+                    text=f"{paper.title}\n{authors}\nhttps://arxiv.org/abs/{paper.versioned_id}\n\n{paper.abstract}",
+                    title=paper.title, kind="reference",
+                    tags=["arxiv", f"arxiv:{paper.arxiv_id}", *paper.categories[:2], *tags],
+                    source="arxiv", source_ref=f"arxiv:{paper.arxiv_id}",
+                    metadata={"arxiv_id": paper.arxiv_id, "version": paper.version, "doi": paper.doi},
+                ))
+                out["logged_event_id"] = ev.id
+            else:
+                out["logged_event_id"] = existing.events[0].id
+                out["already_logged"] = True
+        return out
+
+    @mcp.tool(description="Read a page range (1-based, inclusive) of a cached arXiv paper's extracted text. Fetches the paper first if it is not cached.")
+    @_surface_errors
+    def arxiv_text(
+        id_or_url: Annotated[str, Field(description="arXiv identifier or URL.")],
+        first_page: Annotated[int, Field(ge=1)] = 1,
+        last_page: Annotated[int | None, Field(ge=1, description="Defaults to the last page.")] = None,
+        max_chars: Annotated[int, Field(ge=1, le=400000)] = 40000,
+    ) -> dict[str, Any]:
+        paper, from_cache = arxiv.get(id_or_url)
+        text, first, last = arxiv.read_text(paper, first_page=first_page, last_page=last_page)
+        return {
+            "versioned_id": paper.versioned_id, "title": paper.title, "from_cache": from_cache,
+            "first_page": first, "last_page": last, "pages_total": paper.pages,
+            "text": text[:max_chars], "text_truncated": len(text) > max_chars,
+        }
+
+    @mcp.tool(description="Full-text search across all cached arXiv papers (titles, abstracts, and extracted text). Cache-only; never contacts arXiv.")
+    @_surface_errors
+    def arxiv_search_cache(
+        query: Annotated[str, Field(min_length=1, description="FTS5 query: AND/OR/NOT, \"phrases\", prefix*.")],
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        return {"results": arxiv.search(query, limit=limit)}
+
+    @mcp.tool(description="List cached arXiv papers (most recently accessed first) with cache statistics.")
+    @_surface_errors
+    def arxiv_list_cache(limit: Annotated[int, Field(ge=1, le=1000)] = 100) -> dict[str, Any]:
+        papers = [p.to_dict() for p in arxiv.list(limit=limit)]
+        for p in papers:
+            p.pop("abstract", None)
+        return {"stats": arxiv.stats(), "papers": papers}
+
+    @mcp.resource("arxiv://{arxiv_id}/pdf", mime_type="application/pdf", description="Cached arXiv PDF (fetched on first access).")
+    def arxiv_pdf_resource(arxiv_id: str) -> bytes:
+        paper, _ = arxiv.get(arxiv_id)
+        return arxiv.read_pdf(paper)
+
+    @mcp.resource("arxiv://{arxiv_id}/text", mime_type="text/plain", description="Extracted full text of a cached arXiv paper.")
+    def arxiv_text_resource(arxiv_id: str) -> str:
+        paper, _ = arxiv.get(arxiv_id)
+        return arxiv.read_text(paper)[0]
+
+    @mcp.resource("arxiv://{arxiv_id}/meta", mime_type="application/json", description="Metadata of a cached arXiv paper as JSON.")
+    def arxiv_meta_resource(arxiv_id: str) -> str:
+        paper, _ = arxiv.get(arxiv_id)
+        return json.dumps(paper.to_dict(), indent=2)
+
     return mcp
 
 
@@ -306,9 +416,10 @@ def main() -> None:
 
     p = argparse.ArgumentParser(prog="research-log-mcp", description="Append-only research log MCP server.")
     p.add_argument("--db", default=None, help=f"SQLite database path (default: $RESEARCH_LOG_DB or {DEFAULT_DB_PATH}).")
+    p.add_argument("--arxiv-dir", default=None, help=f"arXiv cache directory (default: $RESEARCH_LOG_ARXIV_DIR or {DEFAULT_CACHE_DIR}).")
     p.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
     args = p.parse_args()
-    create_server(args.db).run(transport=args.transport)
+    create_server(args.db, args.arxiv_dir).run(transport=args.transport)
 
 
 if __name__ == "__main__":

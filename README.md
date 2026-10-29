@@ -17,6 +17,9 @@ MCP client) at it and say "log that the warmup sweep fixed the divergence" or
 - **Single file** at `~/.research-log/log.sqlite3`; back it up by copying it.
 - Ships with a Claude Code **skill** (`/ingest-research-log`) that migrates an
   existing Markdown/text/JSONL log into events.
+- **arXiv PDF cache.** Ask for any arXiv id or URL; the first request downloads
+  the PDF and metadata from arXiv, every later request is served from disk.
+  Extracted text is page-addressable and full-text searchable across the cache.
 
 ## Install
 
@@ -59,7 +62,8 @@ Add to `claude_desktop_config.json`:
 ### Database location
 
 Resolution order: `--db PATH` flag → `RESEARCH_LOG_DB` env var →
-`~/.research-log/log.sqlite3`. The directory is created on first run.
+`~/.research-log/log.sqlite3`. The arXiv cache uses `--arxiv-dir` →
+`RESEARCH_LOG_ARXIV_DIR` → `~/.research-log/arxiv/`. Directories are created on first run.
 The database uses WAL mode, so copy all of `log.sqlite3*` when backing up, or
 use `export_events` for a plain JSONL/Markdown dump.
 
@@ -79,6 +83,36 @@ use `export_events` for a plain JSONL/Markdown dump.
 | `export_events` | Same filters as search; returns JSONL or Markdown for backups and reports. |
 
 Resources: `researchlog://events/{id}`, `researchlog://tags`, `researchlog://stats`.
+
+### arXiv cache tools
+
+| Tool | Purpose |
+|---|---|
+| `arxiv_fetch` | Resolve an id/URL (`1706.03762`, `1706.03762v5`, `arXiv:hep-th/9901001`, `https://arxiv.org/abs/…`, `…/pdf/….pdf`). Cache miss → fetch metadata (Atom API) + PDF from arXiv, extract text, index. Cache hit → no network. Returns metadata, `from_cache`, and the first `max_chars` of text. `refresh=true` re-downloads (e.g. to get a new version). `log_reference=true` also appends a `reference` event to the research log, once per paper. |
+| `arxiv_text` | Read a 1-based inclusive page range of a cached paper's text (fetches first if needed). |
+| `arxiv_search_cache` | FTS5 search across titles, abstracts, and full text of every cached paper. Never contacts arXiv. |
+| `arxiv_list_cache` | Cached papers (most recently accessed first) plus size/hit statistics. |
+
+Resources: `arxiv://{id}/pdf` (binary PDF), `arxiv://{id}/text`, `arxiv://{id}/meta`.
+
+Caching rules:
+
+- An **unversioned** request (`1706.03762`) is served from the cache if *any*
+  version of that paper was ever fetched; the newest cached version wins. arXiv
+  is not consulted to check for newer versions unless `refresh=true`.
+- A **versioned** request (`1706.03762v5`) is cached per version, so two
+  versions of one paper can coexist.
+- If a cached PDF file goes missing on disk, the paper is re-fetched.
+- Outbound requests are throttled to one every 3 seconds, per arXiv's API
+  terms of use, and carry an identifying User-Agent.
+
+Cache layout (`--arxiv-dir`, `RESEARCH_LOG_ARXIV_DIR`, default `~/.research-log/arxiv`):
+
+```
+arxiv.sqlite3        index + FTS5 (title, abstract, full text)
+pdf/<id>v<n>.pdf     the PDF as served by arXiv (old-style ids: hep-th_9901001v3.pdf)
+text/<id>v<n>.txt    extracted text, pages separated by form-feed
+```
 
 ### Event model
 
@@ -144,15 +178,16 @@ uv run python .claude/skills/ingest-research-log/scripts/split_log.py old-log.md
 
 ```bash
 uv sync
-uv run pytest            # store tests + end-to-end tests over stdio
+uv run pytest            # store, arXiv cache (mocked HTTP), and end-to-end stdio tests
 uv run research-log-mcp --db /tmp/scratch.sqlite3   # run against a throwaway db
 ```
 
 Layout:
 
 ```
-src/research_log_mcp/store.py    SQLite schema, append-only triggers, FTS5 search
-src/research_log_mcp/server.py   MCP tools/resources (mcp >= 2.0, MCPServer API)
+src/research_log_mcp/store.py        SQLite schema, append-only triggers, FTS5 search
+src/research_log_mcp/arxiv_cache.py  arXiv metadata/PDF fetch, disk cache, text extraction, FTS
+src/research_log_mcp/server.py       MCP tools/resources (mcp >= 2.0, MCPServer API)
 tests/                           pytest suite
 .claude/skills/ingest-research-log/   Claude Code skill + split_log.py helper
 .mcp.json                        Claude Code project-level server registration
