@@ -125,3 +125,28 @@ def test_tags_sources_kinds_stats(store):
     st = store.stats()
     assert st["events"] == 2 and st["distinct_tags"] == 2 and st["kinds"] == {"idea": 1, "note": 1}
     assert [e.id for e in store.iter_all()] == [1, 2]
+
+
+def test_concurrent_writers(tmp_path):
+    import threading
+
+    from research_log_mcp.store import NewEvent, ResearchLogStore
+
+    db = tmp_path / "log.sqlite3"
+    errors: list[Exception] = []
+
+    def work(n: int) -> None:
+        try:
+            st = ResearchLogStore(db)  # separate connection, like a separate server process
+            for i in range(20):
+                st.append(NewEvent(text=f"w{n} e{i}"))
+            st.close()
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    ts = [threading.Thread(target=work, args=(n,)) for n in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors
+    with ResearchLogStore(db) as st:
+        assert st._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 120

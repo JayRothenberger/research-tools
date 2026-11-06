@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,6 +26,9 @@ from pathlib import Path
 from typing import Any, Iterable, Literal
 
 DEFAULT_DB_PATH = Path(os.environ.get("RESEARCH_LOG_DB", "~/.research-log/log.sqlite3")).expanduser()
+
+# Seconds to wait on another process holding the write lock.
+BUSY_TIMEOUT_S = float(os.environ.get("RESEARCH_LOG_BUSY_TIMEOUT", "60"))
 
 Order = Literal["newest", "oldest", "relevance"]
 
@@ -190,9 +194,33 @@ class ResearchLogStore:
         self.path = Path(path).expanduser() if path else DEFAULT_DB_PATH
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
+        # Several processes (one MCP server per Claude session) share this file.
+        # Wait for locks instead of failing, and never hold the schema/WAL
+        # setup against another writer: only run it when the DB is not yet set up.
+        self._conn = sqlite3.connect(
+            str(self.path), timeout=BUSY_TIMEOUT_S, check_same_thread=False, isolation_level=None
+        )
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA)
+        self._conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_S * 1000)}")
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        for attempt in range(5):
+            try:
+                have = self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'events_fts'"
+                ).fetchone()
+                if have is None:
+                    self._conn.executescript(_SCHEMA)  # idempotent (IF NOT EXISTS)
+                else:
+                    self._conn.execute("PRAGMA foreign_keys = ON")
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) and "busy" not in str(e):
+                    raise
+                if attempt == 4:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
 
     # -- lifecycle ---------------------------------------------------------
     def close(self) -> None:
@@ -221,7 +249,7 @@ class ResearchLogStore:
         items = list(items)
         out: list[tuple[Event | None, int | None]] = []
         cur = self._conn.cursor()
-        cur.execute("BEGIN")
+        cur.execute("BEGIN IMMEDIATE")  # take the write lock up front; busy_timeout waits for it
         try:
             for ev in items:
                 text = (ev.text or "").strip()
